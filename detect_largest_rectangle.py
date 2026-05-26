@@ -2,13 +2,14 @@
 Precise Backlight Panel Rectangle Detection Algorithm
 
 This module detects the backlight panel rectangle in a grayscale image with
-high precision, ensuring the detected boundary tightly fits the actual panel edge.
+high precision, ensuring the detected boundary tightly fits the actual inner
+panel edge (the bright illuminated area), not the outer frame.
 
 Key techniques:
-1. Edge-based detection using Canny for precise boundary localization
-2. Gradient-guided contour refinement for sub-pixel accuracy
-3. Minimal morphological processing to avoid boundary shrinkage
-4. Multi-strategy approach combining threshold and edge methods
+1. High-percentile thresholding to isolate only the brightest region (panel)
+2. Erosion-based boundary tightening to exclude semi-bright frame pixels
+3. Edge-based refinement that pulls boundaries INWARD using gradient direction
+4. Multi-strategy approach with strict bright-region isolation
 """
 
 import cv2
@@ -27,7 +28,7 @@ def preprocess_image(gray_image):
     Returns:
         Preprocessed grayscale image with noise reduced but edges preserved.
     """
-    denoised = cv2.bilateralFilter(gray_image, d=7, sigmaColor=50, sigmaSpace=50)
+    denoised = cv2.bilateralFilter(gray_image, d=5, sigmaColor=40, sigmaSpace=40)
     return denoised
 
 
@@ -75,6 +76,90 @@ def _is_rectangle_like(contour, min_rectangularity=0.80, max_aspect_ratio=10.0):
     return rectangularity > min_rectangularity and aspect_ratio < max_aspect_ratio
 
 
+def _compute_bright_threshold(gray_image):
+    """Compute a threshold that isolates the bright panel from the frame.
+
+    Uses the intensity distribution to find a threshold above which only
+    the actual bright panel pixels exist, excluding the semi-bright frame.
+
+    Args:
+        gray_image: Grayscale image.
+
+    Returns:
+        Threshold value (int).
+    """
+    # Use a high percentile to find the intensity of the bright panel
+    # The panel is very bright (near 255), while the frame is dimmer
+    high_val = np.percentile(gray_image, 85)
+    low_val = np.percentile(gray_image, 30)
+
+    # The threshold should be set between frame brightness and panel brightness
+    # Use a weighted value closer to the bright region
+    threshold = int(low_val + 0.7 * (high_val - low_val))
+
+    # Ensure minimum threshold for very bright panels
+    threshold = max(threshold, 180)
+
+    return threshold
+
+
+def detect_by_bright_threshold(gray_image, preprocessed,
+                               min_area_ratio=0.01, max_area_ratio=0.95):
+    """Detect rectangle by isolating only the brightest region (inner panel).
+
+    Uses a high threshold to select only the actual illuminated panel area,
+    then applies light erosion to tighten the boundary to the true inner edge.
+
+    Args:
+        gray_image: Original grayscale image.
+        preprocessed: Preprocessed (denoised) grayscale image.
+        min_area_ratio: Minimum contour area as ratio of image area.
+        max_area_ratio: Maximum contour area as ratio of image area.
+
+    Returns:
+        A tuple (rect, contour, binary_image) or (None, None, binary_image).
+    """
+    image_area = preprocessed.shape[0] * preprocessed.shape[1]
+    min_area = image_area * min_area_ratio
+    max_area = image_area * max_area_ratio
+
+    # Compute a high threshold that isolates only the bright panel
+    thresh_val = _compute_bright_threshold(preprocessed)
+    _, binary = cv2.threshold(preprocessed, thresh_val, 255, cv2.THRESH_BINARY)
+
+    # Apply small erosion to tighten boundary away from semi-bright frame pixels
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.erode(binary, erode_kernel, iterations=1)
+
+    # Close small gaps within the panel
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+
+    contours, _ = cv2.findContours(
+        cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    best_rect = None
+    best_contour = None
+    best_area = 0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area or area > max_area:
+            continue
+        if _contour_touches_border(contour, preprocessed.shape):
+            continue
+        if not _is_rectangle_like(contour, min_rectangularity=0.75):
+            continue
+
+        if area > best_area:
+            best_area = area
+            best_rect = cv2.minAreaRect(contour)
+            best_contour = contour
+
+    return best_rect, best_contour, cleaned
+
+
 def detect_by_edge(gray_image, preprocessed, min_area_ratio=0.01, max_area_ratio=0.95):
     """Detect rectangle using Canny edge detection for precise boundaries.
 
@@ -94,20 +179,17 @@ def detect_by_edge(gray_image, preprocessed, min_area_ratio=0.01, max_area_ratio
     min_area = image_area * min_area_ratio
     max_area = image_area * max_area_ratio
 
-    # Compute Canny thresholds automatically using median intensity
+    # Use higher Canny thresholds to detect only strong edges (panel boundary)
     median_val = np.median(preprocessed)
-    lower = int(max(0, 0.5 * median_val))
-    upper = int(min(255, 1.5 * median_val))
+    lower = int(max(30, 0.6 * median_val))
+    upper = int(min(255, 1.8 * median_val))
 
-    # Use Canny edge detection for precise edge localization
     edges = cv2.Canny(preprocessed, lower, upper, apertureSize=3, L2gradient=True)
 
-    # Dilate edges slightly to connect nearby edge fragments
-    # Use a small kernel to avoid shifting the boundary
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    # Use minimal dilation to connect edge fragments
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     edges_connected = cv2.dilate(edges, dilate_kernel, iterations=1)
 
-    # Find contours from the edge image
     contours, _ = cv2.findContours(
         edges_connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
@@ -133,127 +215,112 @@ def detect_by_edge(gray_image, preprocessed, min_area_ratio=0.01, max_area_ratio
     return best_rect, best_contour, edges
 
 
-def detect_by_threshold(preprocessed, min_area_ratio=0.01, max_area_ratio=0.95):
-    """Detect rectangle using Otsu threshold with minimal morphological processing.
+def refine_rect_with_edge_scan(gray_image, rect, scan_range=20):
+    """Refine rectangle edges by scanning for the steepest intensity drop.
 
-    For bright-on-dark images (backlight panel), this segments the bright region
-    with minimal boundary erosion.
-
-    Args:
-        preprocessed: Preprocessed grayscale image.
-        min_area_ratio: Minimum contour area as ratio of image area.
-        max_area_ratio: Maximum contour area as ratio of image area.
-
-    Returns:
-        A tuple (rect, contour, binary_image) or (None, None, binary_image).
-    """
-    image_area = preprocessed.shape[0] * preprocessed.shape[1]
-    min_area = image_area * min_area_ratio
-    max_area = image_area * max_area_ratio
-
-    # Otsu threshold for bright panel segmentation
-    _, binary = cv2.threshold(
-        preprocessed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    # Use only closing (no opening/erosion) to fill small internal gaps
-    # without shrinking the boundary
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(
-        cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    best_rect = None
-    best_contour = None
-    best_area = 0
-
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < min_area or area > max_area:
-            continue
-        if _contour_touches_border(contour, preprocessed.shape):
-            continue
-        if not _is_rectangle_like(contour):
-            continue
-
-        if area > best_area:
-            best_area = area
-            best_rect = cv2.minAreaRect(contour)
-            best_contour = contour
-
-    return best_rect, best_contour, cleaned
-
-
-def refine_contour_with_edges(gray_image, contour, search_width=15):
-    """Refine contour points using local gradient maxima for sub-pixel edge accuracy.
-
-    For each point on the contour, searches along the normal direction to find
-    the strongest gradient (actual edge), pulling the contour to the true boundary.
+    For each side of the rectangle, scans inward from the current boundary
+    to find where the intensity drops sharply (transition from bright panel
+    to darker frame), ensuring the boundary is at the INNER edge.
 
     Args:
         gray_image: Original grayscale image.
-        contour: Initial contour to refine.
-        search_width: Number of pixels to search in each direction along the normal.
+        rect: The initial minAreaRect ((cx,cy), (w,h), angle).
+        scan_range: Number of pixels to scan inward from each edge.
 
     Returns:
-        Refined contour with points snapped to actual edges.
+        Refined minAreaRect or the original if refinement fails.
     """
-    if contour is None or len(contour) < 4:
-        return contour
+    if rect is None:
+        return rect
 
     h, w = gray_image.shape[:2]
+    center, size, angle = rect
+    cx, cy = center
+    rw, rh = size
 
-    # Compute gradient magnitude for edge detection
-    grad_x = cv2.Sobel(gray_image, cv2.CV_64F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray_image, cv2.CV_64F, 0, 1, ksize=3)
-    grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
-
-    # Get the minAreaRect to determine edge normals
-    rect = cv2.minAreaRect(contour)
+    # Get the box points to determine edge directions
     box = cv2.boxPoints(rect)
 
-    # For each edge of the rectangle, refine points near that edge
-    refined_points = []
-    contour_points = contour.reshape(-1, 2).astype(np.float64)
+    # Compute inward normals for each edge
+    # Each edge is defined by two adjacent box points
+    refined_offsets = [0.0, 0.0, 0.0, 0.0]  # shrink for each side
 
-    for i in range(len(contour_points)):
-        px, py = contour_points[i]
-        ix, iy = int(round(px)), int(round(py))
+    for edge_idx in range(4):
+        p1 = box[edge_idx]
+        p2 = box[(edge_idx + 1) % 4]
 
-        # Determine local normal direction using neighboring contour points
-        prev_idx = (i - 1) % len(contour_points)
-        next_idx = (i + 1) % len(contour_points)
-        tangent = contour_points[next_idx] - contour_points[prev_idx]
-        tangent_len = np.linalg.norm(tangent)
+        # Edge midpoint
+        mid = (p1 + p2) / 2.0
 
-        if tangent_len < 1e-6:
-            refined_points.append([ix, iy])
+        # Edge direction and inward normal
+        edge_dir = p2 - p1
+        edge_len = np.linalg.norm(edge_dir)
+        if edge_len < 1:
             continue
 
-        tangent = tangent / tangent_len
-        # Normal is perpendicular to tangent
-        normal = np.array([-tangent[1], tangent[0]])
+        edge_dir = edge_dir / edge_len
+        # Inward normal (pointing toward rectangle center)
+        normal = np.array([-edge_dir[1], edge_dir[0]])
 
-        # Search along the normal for the strongest gradient
-        best_grad = 0
-        best_pos = np.array([px, py])
+        # Ensure normal points inward (toward center)
+        to_center = np.array([cx - mid[0], cy - mid[1]])
+        if np.dot(normal, to_center) < 0:
+            normal = -normal
 
-        for offset in range(-search_width, search_width + 1):
-            sx = int(round(px + offset * normal[0]))
-            sy = int(round(py + offset * normal[1]))
-
+        # Sample intensity profile along inward normal from the edge midpoint
+        intensities = []
+        for offset in range(scan_range):
+            sx = int(round(mid[0] + offset * normal[0]))
+            sy = int(round(mid[1] + offset * normal[1]))
             if 0 <= sx < w and 0 <= sy < h:
-                g = grad_mag[sy, sx]
-                if g > best_grad:
-                    best_grad = g
-                    best_pos = np.array([sx, sy])
+                intensities.append(gray_image[sy, sx])
+            else:
+                intensities.append(0)
 
-        refined_points.append([int(best_pos[0]), int(best_pos[1])])
+        if len(intensities) < 5:
+            continue
 
-    refined = np.array(refined_points, dtype=np.int32).reshape(-1, 1, 2)
-    return refined
+        # Find the point where intensity rises sharply (entering the bright panel)
+        # We look for the steepest positive gradient (dark->bright transition)
+        intensities = np.array(intensities, dtype=np.float64)
+        gradients = np.diff(intensities)
+
+        # Find the strongest rising edge (frame -> panel transition)
+        if len(gradients) > 0:
+            max_grad_idx = np.argmax(gradients)
+            max_grad_val = gradients[max_grad_idx]
+
+            # Only refine if there's a significant gradient
+            if max_grad_val > 15:
+                # Place boundary just after the transition (inside the bright area)
+                refined_offsets[edge_idx] = float(max_grad_idx + 1)
+
+    # Apply the refinement by shrinking the rectangle inward
+    # Average the opposing edge offsets for width/height adjustment
+    # Edges 0,2 affect one dimension; edges 1,3 affect the other
+    avg_offset_02 = (refined_offsets[0] + refined_offsets[2]) / 2.0
+    avg_offset_13 = (refined_offsets[1] + refined_offsets[3]) / 2.0
+
+    # Shrink dimensions
+    new_w = max(rw - 2 * avg_offset_02, rw * 0.9)
+    new_h = max(rh - 2 * avg_offset_13, rh * 0.9)
+
+    # Shift center based on asymmetric offsets
+    angle_rad = np.deg2rad(angle)
+    # Direction along width
+    dx_w = np.cos(angle_rad)
+    dy_w = np.sin(angle_rad)
+    # Direction along height
+    dx_h = -np.sin(angle_rad)
+    dy_h = np.cos(angle_rad)
+
+    offset_w = (refined_offsets[0] - refined_offsets[2]) / 2.0
+    offset_h = (refined_offsets[1] - refined_offsets[3]) / 2.0
+
+    new_cx = cx + offset_w * dx_w + offset_h * dx_h
+    new_cy = cy + offset_w * dy_w + offset_h * dy_h
+
+    return ((new_cx, new_cy), (new_w, new_h), angle)
 
 
 def detect_largest_rectangle(
@@ -269,13 +336,13 @@ def detect_largest_rectangle(
 ):
     """Detect the largest rectangle in a grayscale image with high precision.
 
-    This is the main entry point. It combines edge-based detection with threshold-based
-    detection to find the backlight panel boundary that tightly fits the actual edge.
+    This is the main entry point. It detects the backlight panel boundary that
+    tightly fits the actual INNER edge of the bright panel, excluding the frame.
 
-    The algorithm prioritizes precision:
-    1. First tries edge-based detection (Canny) for the tightest boundary
-    2. Falls back to threshold-based detection with minimal morphology
-    3. Refines the detected contour using gradient information
+    The algorithm prioritizes tight inner boundary detection:
+    1. Uses high-threshold segmentation to isolate only the bright panel
+    2. Applies edge-scan refinement to find the exact panel-to-frame transition
+    3. Falls back to edge-based and adaptive threshold methods if needed
 
     Args:
         gray_image: Input grayscale image (numpy array, dtype uint8, single channel).
@@ -315,32 +382,62 @@ def detect_largest_rectangle(
     contour = None
     binary_output = None
 
-    # Step 2: Try threshold-based detection first (works well for bright panel on dark bg)
-    rect, contour, binary_output = detect_by_threshold(
-        preprocessed, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio
+    # Step 2: Primary method - bright threshold isolation
+    # This isolates only the actual bright panel, excluding the semi-bright frame
+    rect, contour, binary_output = detect_by_bright_threshold(
+        gray_image, preprocessed,
+        min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio
     )
 
-    # Step 3: If threshold detection found something, refine with edges
-    if contour is not None:
-        refined_contour = refine_contour_with_edges(gray_image, contour)
-        # Only use refined contour if it's still rectangle-like and has reasonable area
-        if refined_contour is not None and _is_rectangle_like(refined_contour, 0.70):
-            refined_area = cv2.contourArea(refined_contour)
-            image_area = gray_image.shape[0] * gray_image.shape[1]
-            if refined_area > image_area * min_area_ratio:
-                contour = refined_contour
-                rect = cv2.minAreaRect(contour)
+    # Step 3: Refine the detected rectangle using edge scanning
+    # This pulls the boundary inward to the exact panel-frame transition
+    if rect is not None:
+        rect = refine_rect_with_edge_scan(gray_image, rect, scan_range=25)
 
-    # Step 4: If threshold failed, try edge-based detection
+    # Step 4: If bright threshold failed, try edge-based detection
     if rect is None:
         rect, contour, edge_img = detect_by_edge(
             gray_image, preprocessed,
             min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio
         )
+        if rect is not None:
+            rect = refine_rect_with_edge_scan(gray_image, rect, scan_range=25)
         if binary_output is None:
             binary_output = edge_img
 
-    # Step 5: Fallback - try adaptive threshold with minimal morphology
+    # Step 5: Fallback - Otsu threshold with erosion
+    if rect is None:
+        _, binary = cv2.threshold(
+            preprocessed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        # Erode to tighten boundary
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        eroded = cv2.erode(binary, kernel, iterations=2)
+        cleaned = cv2.morphologyEx(eroded, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        image_area = gray_image.shape[0] * gray_image.shape[1]
+        contours, _ = cv2.findContours(
+            cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        best_area = 0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < image_area * min_area_ratio or area > image_area * max_area_ratio:
+                continue
+            if _contour_touches_border(c, gray_image.shape):
+                continue
+            if not _is_rectangle_like(c, 0.70):
+                continue
+            if area > best_area:
+                best_area = area
+                rect = cv2.minAreaRect(c)
+                contour = c
+                binary_output = cleaned
+
+        if rect is not None:
+            rect = refine_rect_with_edge_scan(gray_image, rect, scan_range=25)
+
+    # Step 6: Fallback - adaptive threshold
     if rect is None:
         binary = cv2.adaptiveThreshold(
             preprocessed, 255,
@@ -348,7 +445,6 @@ def detect_largest_rectangle(
             cv2.THRESH_BINARY,
             block_size, c_offset,
         )
-        # Minimal closing only - no opening to avoid boundary shrinkage
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
@@ -370,36 +466,6 @@ def detect_largest_rectangle(
                 rect = cv2.minAreaRect(c)
                 contour = c
                 binary_output = cleaned
-
-    # Step 6: Try inverted adaptive threshold
-    if rect is None:
-        binary_inv = cv2.adaptiveThreshold(
-            preprocessed, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            block_size, c_offset,
-        )
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        cleaned_inv = cv2.morphologyEx(binary_inv, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        image_area = gray_image.shape[0] * gray_image.shape[1]
-        contours, _ = cv2.findContours(
-            cleaned_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        best_area = 0
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < image_area * min_area_ratio or area > image_area * max_area_ratio:
-                continue
-            if _contour_touches_border(c, gray_image.shape):
-                continue
-            if not _is_rectangle_like(c, 0.70):
-                continue
-            if area > best_area:
-                best_area = area
-                rect = cv2.minAreaRect(c)
-                contour = c
-                binary_output = cleaned_inv
 
     # Default binary output if nothing was produced
     if binary_output is None:
