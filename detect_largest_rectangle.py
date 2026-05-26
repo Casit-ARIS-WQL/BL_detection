@@ -78,16 +78,44 @@ def separate_adhesion(binary_image, morph_ksize=5, iterations=2):
     return closed
 
 
-def find_largest_rectangle(binary_image, min_area_ratio=0.01, approx_epsilon=0.02):
+def _contour_touches_border(contour, image_shape, margin=5):
+    """Check if a contour touches the image border within a given margin.
+
+    Args:
+        contour: The contour to check.
+        image_shape: (height, width) of the image.
+        margin: Pixel margin from the border to consider as "touching".
+
+    Returns:
+        True if the contour touches the image border.
+    """
+    h, w = image_shape
+    x, y, cw, ch = cv2.boundingRect(contour)
+    return (
+        x <= margin
+        or y <= margin
+        or (x + cw) >= (w - margin)
+        or (y + ch) >= (h - margin)
+    )
+
+
+def find_largest_rectangle(
+    binary_image, min_area_ratio=0.01, max_area_ratio=0.90, approx_epsilon=0.02,
+    reject_border=True, border_margin=5
+):
     """Find the largest rectangular contour in the binary image.
 
     Uses contour approximation and geometric validation to identify the best
-    rectangle candidate.
+    rectangle candidate. Filters out contours that touch the image border or
+    occupy nearly the entire image area.
 
     Args:
         binary_image: Cleaned binary image.
         min_area_ratio: Minimum contour area as a ratio of image area.
+        max_area_ratio: Maximum contour area as a ratio of image area.
         approx_epsilon: Epsilon factor for contour approximation (relative to perimeter).
+        reject_border: If True, reject contours that touch the image border.
+        border_margin: Pixel margin for border-touching detection.
 
     Returns:
         A tuple (rect, contour) where rect is ((cx, cy), (w, h), angle) from
@@ -103,6 +131,7 @@ def find_largest_rectangle(binary_image, min_area_ratio=0.01, approx_epsilon=0.0
 
     image_area = binary_image.shape[0] * binary_image.shape[1]
     min_area = image_area * min_area_ratio
+    max_area = image_area * max_area_ratio
 
     best_rect = None
     best_contour = None
@@ -111,6 +140,14 @@ def find_largest_rectangle(binary_image, min_area_ratio=0.01, approx_epsilon=0.0
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < min_area:
+            continue
+        if area > max_area:
+            continue
+
+        # Reject contours that touch the image border
+        if reject_border and _contour_touches_border(
+            contour, binary_image.shape, margin=border_margin
+        ):
             continue
 
         # Get minimum area bounding rectangle
@@ -156,13 +193,18 @@ def detect_largest_rectangle(
     morph_ksize=5,
     morph_iterations=2,
     min_area_ratio=0.01,
+    max_area_ratio=0.90,
     approx_epsilon=0.02,
     use_otsu_fallback=True,
+    reject_border=True,
+    border_margin=5,
 ):
     """Detect the largest rectangle in a grayscale image.
 
     This is the main entry point. It handles uneven illumination and adhesion
-    between the rectangle and surrounding areas.
+    between the rectangle and surrounding areas. The algorithm tries multiple
+    binarization strategies and rejects contours that touch the image border
+    or occupy nearly the entire image.
 
     Args:
         gray_image: Input grayscale image (numpy array, dtype uint8, single channel).
@@ -171,9 +213,12 @@ def detect_largest_rectangle(
         morph_ksize: Morphological kernel size for adhesion separation.
         morph_iterations: Number of morphological operation iterations.
         min_area_ratio: Minimum rectangle area as fraction of image area.
+        max_area_ratio: Maximum rectangle area as fraction of image area.
         approx_epsilon: Contour approximation tolerance factor.
         use_otsu_fallback: If True, try Otsu's threshold as fallback when
             adaptive method fails.
+        reject_border: If True, reject contours that touch the image border.
+        border_margin: Pixel margin for border-touching detection.
 
     Returns:
         A dictionary with the following keys:
@@ -195,44 +240,74 @@ def detect_largest_rectangle(
     if gray_image.dtype != np.uint8:
         raise ValueError("Input image must be of dtype uint8")
 
+    find_kwargs = {
+        "min_area_ratio": min_area_ratio,
+        "max_area_ratio": max_area_ratio,
+        "approx_epsilon": approx_epsilon,
+        "reject_border": reject_border,
+        "border_margin": border_margin,
+    }
+
     # Step 1: Preprocess
     preprocessed = preprocess_image(gray_image)
 
-    # Step 2: Adaptive binarization
-    binary = adaptive_binarize(preprocessed, block_size=block_size, c_offset=c_offset)
-
-    # Step 3: Separate adhesion via morphological operations
-    cleaned = separate_adhesion(
-        binary, morph_ksize=morph_ksize, iterations=morph_iterations
+    # Step 2: Try Otsu binarization first (works well for high-contrast bright rect)
+    # Use non-inverted binary to detect bright rectangle directly
+    _, otsu_bin = cv2.threshold(
+        preprocessed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
-
-    # Step 4: Find largest rectangle
-    rect, contour = find_largest_rectangle(
-        cleaned, min_area_ratio=min_area_ratio, approx_epsilon=approx_epsilon
+    otsu_cleaned = separate_adhesion(
+        otsu_bin, morph_ksize=morph_ksize, iterations=morph_iterations
     )
-
-    # Step 5: Fallback to Otsu if adaptive method failed
-    if rect is None and use_otsu_fallback:
-        _, otsu_binary = cv2.threshold(
-            preprocessed, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    rect, contour = find_largest_rectangle(otsu_cleaned, **find_kwargs)
+    if rect is not None:
+        cleaned = otsu_cleaned
+    else:
+        # Step 3: Try adaptive binarization (non-inverted for bright rectangle)
+        binary_non_inv = cv2.adaptiveThreshold(
+            preprocessed,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            block_size,
+            c_offset,
         )
-        otsu_cleaned = separate_adhesion(
-            otsu_binary, morph_ksize=morph_ksize, iterations=morph_iterations
+        cleaned_non_inv = separate_adhesion(
+            binary_non_inv, morph_ksize=morph_ksize, iterations=morph_iterations
         )
-        rect, contour = find_largest_rectangle(
-            otsu_cleaned, min_area_ratio=min_area_ratio, approx_epsilon=approx_epsilon
-        )
+        rect, contour = find_largest_rectangle(cleaned_non_inv, **find_kwargs)
         if rect is not None:
-            cleaned = otsu_cleaned
+            cleaned = cleaned_non_inv
+        else:
+            # Step 4: Try adaptive binarization (inverted, original approach)
+            binary = adaptive_binarize(
+                preprocessed, block_size=block_size, c_offset=c_offset
+            )
+            cleaned = separate_adhesion(
+                binary, morph_ksize=morph_ksize, iterations=morph_iterations
+            )
+            rect, contour = find_largest_rectangle(cleaned, **find_kwargs)
 
-    # Step 6: Try inverted binary as another fallback (rectangle may be lighter)
-    if rect is None:
-        inverted = cv2.bitwise_not(cleaned)
-        rect, contour = find_largest_rectangle(
-            inverted, min_area_ratio=min_area_ratio, approx_epsilon=approx_epsilon
-        )
-        if rect is not None:
-            cleaned = inverted
+            # Step 5: Fallback to Otsu inverted
+            if rect is None and use_otsu_fallback:
+                _, otsu_binary_inv = cv2.threshold(
+                    preprocessed, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+                )
+                otsu_inv_cleaned = separate_adhesion(
+                    otsu_binary_inv, morph_ksize=morph_ksize, iterations=morph_iterations
+                )
+                rect, contour = find_largest_rectangle(
+                    otsu_inv_cleaned, **find_kwargs
+                )
+                if rect is not None:
+                    cleaned = otsu_inv_cleaned
+
+            # Step 6: Try inverted of the cleaned binary as last resort
+            if rect is None:
+                inverted = cv2.bitwise_not(cleaned)
+                rect, contour = find_largest_rectangle(inverted, **find_kwargs)
+                if rect is not None:
+                    cleaned = inverted
 
     # Build result
     box = None
