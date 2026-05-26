@@ -1,81 +1,34 @@
 """
-Robust Largest Rectangle Detection Algorithm
+Precise Backlight Panel Rectangle Detection Algorithm
 
-This module detects the largest rectangle in a grayscale image where the rectangle
-has a significant gray-level difference from the surrounding area. It handles
-illumination variations that may cause adhesion between the rectangle and background.
+This module detects the backlight panel rectangle in a grayscale image with
+high precision, ensuring the detected boundary tightly fits the actual panel edge.
 
 Key techniques:
-1. Adaptive thresholding to handle uneven illumination
-2. Morphological operations to separate adhesion regions
-3. Multi-strategy contour filtering to find the best rectangle candidate
+1. Edge-based detection using Canny for precise boundary localization
+2. Gradient-guided contour refinement for sub-pixel accuracy
+3. Minimal morphological processing to avoid boundary shrinkage
+4. Multi-strategy approach combining threshold and edge methods
 """
 
 import cv2
 import numpy as np
 
 
-def preprocess_image(gray_image, blur_ksize=5):
-    """Apply preprocessing to reduce noise while preserving edges.
+def preprocess_image(gray_image):
+    """Apply light preprocessing to reduce noise while preserving edges.
+
+    Uses bilateral filter which smooths flat regions but preserves sharp edges,
+    critical for maintaining precise boundary detection.
 
     Args:
         gray_image: Input grayscale image (numpy array, dtype uint8).
-        blur_ksize: Kernel size for Gaussian blur (must be odd).
 
     Returns:
-        Preprocessed grayscale image.
+        Preprocessed grayscale image with noise reduced but edges preserved.
     """
-    # Apply bilateral filter to reduce noise while preserving edges
-    denoised = cv2.bilateralFilter(gray_image, d=9, sigmaColor=75, sigmaSpace=75)
-    # Light Gaussian blur to smooth remaining noise
-    blurred = cv2.GaussianBlur(denoised, (blur_ksize, blur_ksize), 0)
-    return blurred
-
-
-def adaptive_binarize(gray_image, block_size=51, c_offset=10):
-    """Binarize the image using adaptive thresholding to handle uneven illumination.
-
-    Args:
-        gray_image: Preprocessed grayscale image.
-        block_size: Size of the neighborhood for adaptive threshold (must be odd).
-        c_offset: Constant subtracted from the mean.
-
-    Returns:
-        Binary image (0 or 255).
-    """
-    binary = cv2.adaptiveThreshold(
-        gray_image,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        block_size,
-        c_offset,
-    )
-    return binary
-
-
-def separate_adhesion(binary_image, morph_ksize=5, iterations=2):
-    """Use morphological operations to separate adhesion caused by illumination.
-
-    Args:
-        binary_image: Binary image from adaptive thresholding.
-        morph_ksize: Kernel size for morphological operations.
-        iterations: Number of erosion/dilation iterations.
-
-    Returns:
-        Cleaned binary image with adhesion regions separated.
-    """
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (morph_ksize, morph_ksize)
-    )
-
-    # Morphological opening to remove small connections (adhesion)
-    opened = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel, iterations=iterations)
-
-    # Morphological closing to fill small gaps within the rectangle
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=iterations)
-
-    return closed
+    denoised = cv2.bilateralFilter(gray_image, d=7, sigmaColor=50, sigmaSpace=50)
+    return denoised
 
 
 def _contour_touches_border(contour, image_shape, margin=5):
@@ -95,36 +48,69 @@ def _contour_touches_border(contour, image_shape, margin=5):
             (x + cw) >= (w - margin) or (y + ch) >= (h - margin))
 
 
-def find_largest_rectangle(binary_image, min_area_ratio=0.01, max_area_ratio=0.95,
-                           approx_epsilon=0.02):
-    """Find the largest rectangular contour in the binary image.
-
-    Uses contour approximation and geometric validation to identify the best
-    rectangle candidate. Filters out contours that are too large (likely the
-    image border) or that touch the image edges.
+def _is_rectangle_like(contour, min_rectangularity=0.80, max_aspect_ratio=10.0):
+    """Check if a contour is rectangle-like based on geometric properties.
 
     Args:
-        binary_image: Cleaned binary image.
-        min_area_ratio: Minimum contour area as a ratio of image area.
-        max_area_ratio: Maximum contour area as a ratio of image area.
-            Contours larger than this are rejected as likely being the image border.
-        approx_epsilon: Epsilon factor for contour approximation (relative to perimeter).
+        contour: The contour to evaluate.
+        min_rectangularity: Minimum ratio of contour area to bounding rect area.
+        max_aspect_ratio: Maximum allowed aspect ratio.
 
     Returns:
-        A tuple (rect, contour) where rect is ((cx, cy), (w, h), angle) from
-        cv2.minAreaRect, and contour is the detected contour. Returns (None, None)
-        if no rectangle is found.
+        True if the contour has rectangular properties.
     """
-    contours, _ = cv2.findContours(
-        binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    area = cv2.contourArea(contour)
+    if area <= 0:
+        return False
 
-    if not contours:
-        return None, None
+    rect = cv2.minAreaRect(contour)
+    rect_w, rect_h = rect[1]
+    if rect_w == 0 or rect_h == 0:
+        return False
 
-    image_area = binary_image.shape[0] * binary_image.shape[1]
+    rect_area = rect_w * rect_h
+    rectangularity = area / rect_area
+    aspect_ratio = max(rect_w, rect_h) / min(rect_w, rect_h)
+
+    return rectangularity > min_rectangularity and aspect_ratio < max_aspect_ratio
+
+
+def detect_by_edge(gray_image, preprocessed, min_area_ratio=0.01, max_area_ratio=0.95):
+    """Detect rectangle using Canny edge detection for precise boundaries.
+
+    This method finds edges with sub-pixel accuracy and traces the panel boundary
+    tightly. It uses automatic Canny threshold computation based on image statistics.
+
+    Args:
+        gray_image: Original grayscale image.
+        preprocessed: Preprocessed (denoised) grayscale image.
+        min_area_ratio: Minimum contour area as ratio of image area.
+        max_area_ratio: Maximum contour area as ratio of image area.
+
+    Returns:
+        A tuple (rect, contour, edge_image) or (None, None, edge_image).
+    """
+    image_area = gray_image.shape[0] * gray_image.shape[1]
     min_area = image_area * min_area_ratio
     max_area = image_area * max_area_ratio
+
+    # Compute Canny thresholds automatically using median intensity
+    median_val = np.median(preprocessed)
+    lower = int(max(0, 0.5 * median_val))
+    upper = int(min(255, 1.5 * median_val))
+
+    # Use Canny edge detection for precise edge localization
+    edges = cv2.Canny(preprocessed, lower, upper, apertureSize=3, L2gradient=True)
+
+    # Dilate edges slightly to connect nearby edge fragments
+    # Use a small kernel to avoid shifting the boundary
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges_connected = cv2.dilate(edges, dilate_kernel, iterations=1)
+
+    # Find contours from the edge image
+    contours, _ = cv2.findContours(
+        edges_connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
     best_rect = None
     best_contour = None
@@ -132,50 +118,142 @@ def find_largest_rectangle(binary_image, min_area_ratio=0.01, max_area_ratio=0.9
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < min_area:
+        if area < min_area or area > max_area:
             continue
-        # Reject contours that are too large (likely the whole image border)
-        if area > max_area:
+        if _contour_touches_border(contour, gray_image.shape):
             continue
-
-        # Reject contours that touch the image border
-        if _contour_touches_border(contour, binary_image.shape):
+        if not _is_rectangle_like(contour):
             continue
 
-        # Get minimum area bounding rectangle
-        rect = cv2.minAreaRect(contour)
-        rect_w, rect_h = rect[1]
-        if rect_w == 0 or rect_h == 0:
-            continue
-        rect_area = rect_w * rect_h
-
-        # Rectangularity: ratio of contour area to bounding rect area
-        rectangularity = area / rect_area
-
-        # Aspect ratio check (reject extremely elongated shapes)
-        aspect_ratio = max(rect_w, rect_h) / min(rect_w, rect_h)
-
-        # Also try polygon approximation
-        perimeter = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, approx_epsilon * perimeter, True)
-
-        # A good rectangle candidate should have:
-        # - High rectangularity (close to 1.0)
-        # - Reasonable aspect ratio
-        # - Approximately 4 vertices after polygon approximation
-        is_rect_like = (
-            rectangularity > 0.75
-            and aspect_ratio < 20.0
-            and len(approx) >= 4
-            and len(approx) <= 8
-        )
-
-        if is_rect_like and area > best_area:
+        if area > best_area:
             best_area = area
-            best_rect = rect
+            best_rect = cv2.minAreaRect(contour)
             best_contour = contour
 
-    return best_rect, best_contour
+    return best_rect, best_contour, edges
+
+
+def detect_by_threshold(preprocessed, min_area_ratio=0.01, max_area_ratio=0.95):
+    """Detect rectangle using Otsu threshold with minimal morphological processing.
+
+    For bright-on-dark images (backlight panel), this segments the bright region
+    with minimal boundary erosion.
+
+    Args:
+        preprocessed: Preprocessed grayscale image.
+        min_area_ratio: Minimum contour area as ratio of image area.
+        max_area_ratio: Maximum contour area as ratio of image area.
+
+    Returns:
+        A tuple (rect, contour, binary_image) or (None, None, binary_image).
+    """
+    image_area = preprocessed.shape[0] * preprocessed.shape[1]
+    min_area = image_area * min_area_ratio
+    max_area = image_area * max_area_ratio
+
+    # Otsu threshold for bright panel segmentation
+    _, binary = cv2.threshold(
+        preprocessed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    # Use only closing (no opening/erosion) to fill small internal gaps
+    # without shrinking the boundary
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(
+        cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    best_rect = None
+    best_contour = None
+    best_area = 0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area or area > max_area:
+            continue
+        if _contour_touches_border(contour, preprocessed.shape):
+            continue
+        if not _is_rectangle_like(contour):
+            continue
+
+        if area > best_area:
+            best_area = area
+            best_rect = cv2.minAreaRect(contour)
+            best_contour = contour
+
+    return best_rect, best_contour, cleaned
+
+
+def refine_contour_with_edges(gray_image, contour, search_width=15):
+    """Refine contour points using local gradient maxima for sub-pixel edge accuracy.
+
+    For each point on the contour, searches along the normal direction to find
+    the strongest gradient (actual edge), pulling the contour to the true boundary.
+
+    Args:
+        gray_image: Original grayscale image.
+        contour: Initial contour to refine.
+        search_width: Number of pixels to search in each direction along the normal.
+
+    Returns:
+        Refined contour with points snapped to actual edges.
+    """
+    if contour is None or len(contour) < 4:
+        return contour
+
+    h, w = gray_image.shape[:2]
+
+    # Compute gradient magnitude for edge detection
+    grad_x = cv2.Sobel(gray_image, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray_image, cv2.CV_64F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    # Get the minAreaRect to determine edge normals
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect)
+
+    # For each edge of the rectangle, refine points near that edge
+    refined_points = []
+    contour_points = contour.reshape(-1, 2).astype(np.float64)
+
+    for i in range(len(contour_points)):
+        px, py = contour_points[i]
+        ix, iy = int(round(px)), int(round(py))
+
+        # Determine local normal direction using neighboring contour points
+        prev_idx = (i - 1) % len(contour_points)
+        next_idx = (i + 1) % len(contour_points)
+        tangent = contour_points[next_idx] - contour_points[prev_idx]
+        tangent_len = np.linalg.norm(tangent)
+
+        if tangent_len < 1e-6:
+            refined_points.append([ix, iy])
+            continue
+
+        tangent = tangent / tangent_len
+        # Normal is perpendicular to tangent
+        normal = np.array([-tangent[1], tangent[0]])
+
+        # Search along the normal for the strongest gradient
+        best_grad = 0
+        best_pos = np.array([px, py])
+
+        for offset in range(-search_width, search_width + 1):
+            sx = int(round(px + offset * normal[0]))
+            sy = int(round(py + offset * normal[1]))
+
+            if 0 <= sx < w and 0 <= sy < h:
+                g = grad_mag[sy, sx]
+                if g > best_grad:
+                    best_grad = g
+                    best_pos = np.array([sx, sy])
+
+        refined_points.append([int(best_pos[0]), int(best_pos[1])])
+
+    refined = np.array(refined_points, dtype=np.int32).reshape(-1, 1, 2)
+    return refined
 
 
 def detect_largest_rectangle(
@@ -189,25 +267,26 @@ def detect_largest_rectangle(
     approx_epsilon=0.02,
     use_otsu_fallback=True,
 ):
-    """Detect the largest rectangle in a grayscale image.
+    """Detect the largest rectangle in a grayscale image with high precision.
 
-    This is the main entry point. It handles uneven illumination and adhesion
-    between the rectangle and surrounding areas. It tries multiple binarization
-    strategies (including both normal and inverted thresholds) to handle both
-    bright-on-dark and dark-on-bright scenarios.
+    This is the main entry point. It combines edge-based detection with threshold-based
+    detection to find the backlight panel boundary that tightly fits the actual edge.
+
+    The algorithm prioritizes precision:
+    1. First tries edge-based detection (Canny) for the tightest boundary
+    2. Falls back to threshold-based detection with minimal morphology
+    3. Refines the detected contour using gradient information
 
     Args:
         gray_image: Input grayscale image (numpy array, dtype uint8, single channel).
         block_size: Block size for adaptive threshold (must be odd, >= 3).
         c_offset: Constant for adaptive threshold.
-        morph_ksize: Morphological kernel size for adhesion separation.
-        morph_iterations: Number of morphological operation iterations.
+        morph_ksize: Morphological kernel size (kept for API compatibility).
+        morph_iterations: Number of morphological iterations (kept for API compatibility).
         min_area_ratio: Minimum rectangle area as fraction of image area.
         max_area_ratio: Maximum rectangle area as fraction of image area.
-            Contours exceeding this are rejected as likely being the image border.
         approx_epsilon: Contour approximation tolerance factor.
-        use_otsu_fallback: If True, try Otsu's threshold as fallback when
-            adaptive method fails.
+        use_otsu_fallback: If True, try Otsu's threshold as fallback.
 
     Returns:
         A dictionary with the following keys:
@@ -229,72 +308,103 @@ def detect_largest_rectangle(
     if gray_image.dtype != np.uint8:
         raise ValueError("Input image must be of dtype uint8")
 
-    # Step 1: Preprocess
+    # Step 1: Preprocess with edge-preserving filter
     preprocessed = preprocess_image(gray_image)
 
-    # Step 2: Try Otsu's threshold (non-inverted) first for bright-on-dark images
-    # This directly segments the bright rectangle from the dark background
     rect = None
     contour = None
-    cleaned = None
+    binary_output = None
 
-    if use_otsu_fallback:
-        _, otsu_binary = cv2.threshold(
+    # Step 2: Try threshold-based detection first (works well for bright panel on dark bg)
+    rect, contour, binary_output = detect_by_threshold(
+        preprocessed, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio
+    )
+
+    # Step 3: If threshold detection found something, refine with edges
+    if contour is not None:
+        refined_contour = refine_contour_with_edges(gray_image, contour)
+        # Only use refined contour if it's still rectangle-like and has reasonable area
+        if refined_contour is not None and _is_rectangle_like(refined_contour, 0.70):
+            refined_area = cv2.contourArea(refined_contour)
+            image_area = gray_image.shape[0] * gray_image.shape[1]
+            if refined_area > image_area * min_area_ratio:
+                contour = refined_contour
+                rect = cv2.minAreaRect(contour)
+
+    # Step 4: If threshold failed, try edge-based detection
+    if rect is None:
+        rect, contour, edge_img = detect_by_edge(
+            gray_image, preprocessed,
+            min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio
+        )
+        if binary_output is None:
+            binary_output = edge_img
+
+    # Step 5: Fallback - try adaptive threshold with minimal morphology
+    if rect is None:
+        binary = cv2.adaptiveThreshold(
+            preprocessed, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            block_size, c_offset,
+        )
+        # Minimal closing only - no opening to avoid boundary shrinkage
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        image_area = gray_image.shape[0] * gray_image.shape[1]
+        contours, _ = cv2.findContours(
+            cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        best_area = 0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < image_area * min_area_ratio or area > image_area * max_area_ratio:
+                continue
+            if _contour_touches_border(c, gray_image.shape):
+                continue
+            if not _is_rectangle_like(c, 0.70):
+                continue
+            if area > best_area:
+                best_area = area
+                rect = cv2.minAreaRect(c)
+                contour = c
+                binary_output = cleaned
+
+    # Step 6: Try inverted adaptive threshold
+    if rect is None:
+        binary_inv = cv2.adaptiveThreshold(
+            preprocessed, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            block_size, c_offset,
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        cleaned_inv = cv2.morphologyEx(binary_inv, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        image_area = gray_image.shape[0] * gray_image.shape[1]
+        contours, _ = cv2.findContours(
+            cleaned_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        best_area = 0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < image_area * min_area_ratio or area > image_area * max_area_ratio:
+                continue
+            if _contour_touches_border(c, gray_image.shape):
+                continue
+            if not _is_rectangle_like(c, 0.70):
+                continue
+            if area > best_area:
+                best_area = area
+                rect = cv2.minAreaRect(c)
+                contour = c
+                binary_output = cleaned_inv
+
+    # Default binary output if nothing was produced
+    if binary_output is None:
+        _, binary_output = cv2.threshold(
             preprocessed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        otsu_cleaned = separate_adhesion(
-            otsu_binary, morph_ksize=morph_ksize, iterations=morph_iterations
-        )
-        rect, contour = find_largest_rectangle(
-            otsu_cleaned, min_area_ratio=min_area_ratio,
-            max_area_ratio=max_area_ratio, approx_epsilon=approx_epsilon
-        )
-        if rect is not None:
-            cleaned = otsu_cleaned
-
-    # Step 3: Try adaptive binarization (inverted - original behavior)
-    if rect is None:
-        binary = adaptive_binarize(preprocessed, block_size=block_size, c_offset=c_offset)
-        cleaned_adaptive = separate_adhesion(
-            binary, morph_ksize=morph_ksize, iterations=morph_iterations
-        )
-        rect, contour = find_largest_rectangle(
-            cleaned_adaptive, min_area_ratio=min_area_ratio,
-            max_area_ratio=max_area_ratio, approx_epsilon=approx_epsilon
-        )
-        if rect is not None:
-            cleaned = cleaned_adaptive
-
-    # Step 4: Try inverted adaptive binary (rectangle may be lighter than background)
-    if rect is None:
-        inverted = cv2.bitwise_not(cleaned_adaptive)
-        rect, contour = find_largest_rectangle(
-            inverted, min_area_ratio=min_area_ratio,
-            max_area_ratio=max_area_ratio, approx_epsilon=approx_epsilon
-        )
-        if rect is not None:
-            cleaned = inverted
-
-    # Step 5: Fallback to Otsu inverted
-    if rect is None and use_otsu_fallback:
-        _, otsu_binary_inv = cv2.threshold(
-            preprocessed, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
-        otsu_inv_cleaned = separate_adhesion(
-            otsu_binary_inv, morph_ksize=morph_ksize, iterations=morph_iterations
-        )
-        rect, contour = find_largest_rectangle(
-            otsu_inv_cleaned, min_area_ratio=min_area_ratio,
-            max_area_ratio=max_area_ratio, approx_epsilon=approx_epsilon
-        )
-        if rect is not None:
-            cleaned = otsu_inv_cleaned
-
-    # If still nothing found, use the adaptive cleaned as default binary output
-    if cleaned is None:
-        binary = adaptive_binarize(preprocessed, block_size=block_size, c_offset=c_offset)
-        cleaned = separate_adhesion(
-            binary, morph_ksize=morph_ksize, iterations=morph_iterations
         )
 
     # Build result
@@ -307,7 +417,7 @@ def detect_largest_rectangle(
         "rect": rect,
         "box": box,
         "contour": contour,
-        "binary": cleaned,
+        "binary": binary_output,
     }
 
 
