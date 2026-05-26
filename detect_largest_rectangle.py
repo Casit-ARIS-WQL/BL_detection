@@ -15,6 +15,7 @@ Key techniques:
 
 import cv2
 import numpy as np
+from collections import deque
 
 
 def preprocess_image(gray_image):
@@ -102,6 +103,100 @@ def _find_bright_region_center(gray_image):
         cy, cx = gray_image.shape[0] // 2, gray_image.shape[1] // 2
 
     return cx, cy
+
+
+def detect_by_center_mask_growth(gray_image, preprocessed,
+                                 min_area_ratio=0.01, max_area_ratio=0.95,
+                                 intensity_diff_threshold=None):
+    """Detect rectangle by center-seeded mask growth with local stopping.
+
+    Starts from the bright center and expands a mask pixel-by-pixel. Each growth
+    branch stops when the new pixel has a large intensity difference from the
+    center intensity, while other branches continue expanding until no branch can
+    expand further.
+
+    Args:
+        gray_image: Original grayscale image.
+        preprocessed: Preprocessed grayscale image.
+        min_area_ratio: Minimum contour area as ratio of image area.
+        max_area_ratio: Maximum contour area as ratio of image area.
+        intensity_diff_threshold: Absolute intensity difference threshold.
+
+    Returns:
+        A tuple (rect, contour, binary_image) or (None, None, binary_image).
+    """
+    h, w = preprocessed.shape[:2]
+    image_area = h * w
+    min_area = image_area * min_area_ratio
+    max_area = image_area * max_area_ratio
+
+    cx, cy = _find_bright_region_center(preprocessed)
+    center_intensity = float(preprocessed[cy, cx])
+
+    if intensity_diff_threshold is None:
+        local_half = 5
+        y0 = max(0, cy - local_half)
+        y1 = min(h, cy + local_half + 1)
+        x0 = max(0, cx - local_half)
+        x1 = min(w, cx + local_half + 1)
+        local_patch = preprocessed[y0:y1, x0:x1]
+        local_std = float(np.std(local_patch))
+        intensity_diff_threshold = max(20.0, min(80.0, 2.5 * local_std + 15.0))
+
+    visited = np.zeros((h, w), dtype=bool)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    q = deque()
+    q.append((cx, cy))
+    visited[cy, cx] = True
+    mask[cy, cx] = 255
+
+    neighbors = [
+        (-1, -1), (0, -1), (1, -1),
+        (-1, 0),           (1, 0),
+        (-1, 1),  (0, 1),  (1, 1),
+    ]
+
+    while q:
+        x, y = q.popleft()
+        for dx, dy in neighbors:
+            nx = x + dx
+            ny = y + dy
+            if nx < 0 or nx >= w or ny < 0 or ny >= h:
+                continue
+            if visited[ny, nx]:
+                continue
+
+            visited[ny, nx] = True
+            if abs(float(preprocessed[ny, nx]) - center_intensity) <= intensity_diff_threshold:
+                mask[ny, nx] = 255
+                q.append((nx, ny))
+
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, None, mask
+
+    best_rect = None
+    best_contour = None
+    best_area = 0.0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area or area > max_area:
+            continue
+        if _contour_touches_border(contour, preprocessed.shape):
+            continue
+        if not _is_rectangle_like(contour, min_rectangularity=0.60):
+            continue
+
+        if area > best_area:
+            best_area = area
+            best_contour = contour
+            best_rect = cv2.minAreaRect(contour)
+
+    return best_rect, best_contour, mask
 
 
 def _find_edge_by_gradient_scan(gray_image, start_x, start_y, dx, dy,
@@ -646,11 +741,12 @@ def detect_largest_rectangle(
     tightly fits the actual INNER edge of the bright panel, excluding the frame.
 
     The algorithm uses a multi-strategy approach prioritizing inner boundary:
-    1. Scanline-based detection from bright center outward (most accurate)
-    2. High-threshold segmentation with aggressive erosion
-    3. Edge-scan refinement to find exact panel-to-frame transition
-    4. Hough line detection for straight edge refinement
-    5. Falls back to edge-based and adaptive threshold methods if needed
+    1. Center-seeded mask growth with branch-wise stopping by intensity difference
+    2. Scanline-based detection from bright center outward
+    3. High-threshold segmentation with aggressive erosion
+    4. Edge-scan refinement to find exact panel-to-frame transition
+    5. Hough line detection for straight edge refinement
+    6. Falls back to edge-based and adaptive threshold methods if needed
 
     Args:
         gray_image: Input grayscale image (numpy array, dtype uint8, single channel).
@@ -690,18 +786,24 @@ def detect_largest_rectangle(
     contour = None
     binary_output = None
 
-    # Step 2: Primary method - scanline-based detection from center outward
-    # This is the most accurate method for finding the inner panel edge
-    rect, contour, _ = detect_by_scanline(
+    # Step 2: Primary method - center-seeded progressive mask growth
+    rect, contour, binary_output = detect_by_center_mask_growth(
         gray_image, preprocessed,
         min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio
     )
-
-    # Step 3: If scanline worked, refine with Hough lines for straight edges
     if rect is not None:
         rect = _refine_with_hough_lines(preprocessed, rect)
 
-    # Step 4: If scanline failed, try bright threshold isolation
+    # Step 3: Secondary method - scanline detection from center outward
+    if rect is None:
+        rect, contour, _ = detect_by_scanline(
+            gray_image, preprocessed,
+            min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio
+        )
+        if rect is not None:
+            rect = _refine_with_hough_lines(preprocessed, rect)
+
+    # Step 4: If center growth and scanline failed, try bright threshold isolation
     if rect is None:
         rect, contour, binary_output = detect_by_bright_threshold(
             gray_image, preprocessed,
