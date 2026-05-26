@@ -208,7 +208,8 @@ def detect_by_scanline(gray_image, preprocessed,
 
     This is the most accurate method: it starts from the known bright center
     of the panel and scans outward in 4 directions to find exactly where the
-    brightness drops off (the inner panel edge).
+    brightness drops off (the inner panel edge). It then uses cv2.minAreaRect
+    on the bright region contour to obtain a properly rotated bounding box.
 
     Args:
         gray_image: Original grayscale image.
@@ -273,20 +274,72 @@ def detect_by_scanline(gray_image, preprocessed,
     if aspect > 10:
         return None, None, None
 
-    # Create the rectangle (axis-aligned from scanline detection)
-    rect_cx = (x_left + x_right) / 2.0
-    rect_cy = (y_top + y_bottom) / 2.0
-    rect = ((rect_cx, rect_cy), (float(det_w), float(det_h)), 0.0)
+    # Use a binary threshold on the bright region to get a rotated bounding box.
+    # The scanline result gives us the approximate region; now find the precise
+    # rotated rectangle by thresholding the bright panel area and fitting minAreaRect.
+    center_intensity = float(preprocessed[
+        max(0, min(h - 1, cy)), max(0, min(w - 1, cx))
+    ])
+    # Threshold at 70% of center brightness to isolate the bright panel
+    thresh_val = int(center_intensity * 0.70)
+    thresh_val = max(thresh_val, 150)
+    _, bright_binary = cv2.threshold(preprocessed, thresh_val, 255, cv2.THRESH_BINARY)
 
-    # Create a contour for the detected region
-    contour = np.array([
-        [[x_left, y_top]],
-        [[x_right, y_top]],
-        [[x_right, y_bottom]],
-        [[x_left, y_bottom]]
-    ], dtype=np.int32)
+    # Restrict to the scanline-detected region with some margin
+    margin = max(20, int(max(det_w, det_h) * 0.05))
+    roi_x1 = max(0, x_left - margin)
+    roi_y1 = max(0, y_top - margin)
+    roi_x2 = min(w, x_right + margin)
+    roi_y2 = min(h, y_bottom + margin)
 
-    return rect, contour, None
+    roi_binary = bright_binary[roi_y1:roi_y2, roi_x1:roi_x2]
+
+    # Clean up the binary ROI
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    roi_binary = cv2.erode(roi_binary, erode_kernel, iterations=1)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    roi_binary = cv2.morphologyEx(roi_binary, cv2.MORPH_CLOSE, close_kernel,
+                                  iterations=2)
+
+    # Find contours in the ROI
+    contours, _ = cv2.findContours(
+        roi_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    best_contour = None
+    best_area = 0
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area > best_area:
+            best_area = area
+            best_contour = c
+
+    if best_contour is not None and best_area > det_area * 0.3:
+        # Offset contour coordinates back to full image space
+        best_contour = best_contour + np.array([[[roi_x1, roi_y1]]], dtype=np.int32)
+        rect = cv2.minAreaRect(best_contour)
+        contour = best_contour
+
+        # Validate the rotated rect area
+        rect_area = rect[1][0] * rect[1][1]
+        if rect_area < image_area * min_area_ratio or rect_area > image_area * max_area_ratio:
+            return None, None, None
+
+        return rect, contour, bright_binary
+    else:
+        # Fallback: return axis-aligned rectangle from scanline detection
+        rect_cx = (x_left + x_right) / 2.0
+        rect_cy = (y_top + y_bottom) / 2.0
+        rect = ((rect_cx, rect_cy), (float(det_w), float(det_h)), 0.0)
+
+        contour = np.array([
+            [[x_left, y_top]],
+            [[x_right, y_top]],
+            [[x_right, y_bottom]],
+            [[x_left, y_bottom]]
+        ], dtype=np.int32)
+
+        return rect, contour, None
 
 
 def detect_by_bright_threshold(gray_image, preprocessed,
@@ -538,7 +591,8 @@ def _refine_with_hough_lines(gray_image, rect):
     """Refine rectangle using Hough line detection for straight edges.
 
     Detects straight lines near the initial rectangle boundaries and
-    uses them to produce a more precise axis-aligned or rotated rectangle.
+    uses them to refine the rectangle size and position while preserving
+    the rotation angle from the input rectangle.
 
     Args:
         gray_image: Grayscale image.
@@ -580,21 +634,48 @@ def _refine_with_hough_lines(gray_image, rect):
     if lines is None or len(lines) < 2:
         return rect
 
-    # Classify lines as roughly horizontal or vertical
+    # Classify lines as roughly horizontal or vertical and collect angles
     h_lines = []
     v_lines = []
+    h_angles = []
+    v_angles = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
-        line_angle = abs(np.arctan2(y2 - y1, x2 - x1))
-        if line_angle < np.pi / 6 or line_angle > 5 * np.pi / 6:
+        line_angle = np.arctan2(y2 - y1, x2 - x1)
+        abs_angle = abs(line_angle)
+        line_length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        if abs_angle < np.pi / 6 or abs_angle > 5 * np.pi / 6:
             # Horizontal-ish
             h_lines.append((y1 + y_min + y2 + y_min) / 2.0)
-        elif np.pi / 3 < line_angle < 2 * np.pi / 3:
+            # Normalize angle to [-pi/4, pi/4] range
+            normalized = line_angle if abs_angle < np.pi / 6 else (
+                line_angle - np.pi if line_angle > 0 else line_angle + np.pi)
+            h_angles.append((normalized, line_length))
+        elif np.pi / 3 < abs_angle < 2 * np.pi / 3:
             # Vertical-ish
             v_lines.append((x1 + x_min + x2 + x_min) / 2.0)
+            # Convert to deviation from vertical
+            normalized = line_angle - np.pi / 2 if line_angle > 0 else line_angle + np.pi / 2
+            v_angles.append((normalized, line_length))
 
     if len(h_lines) < 2 or len(v_lines) < 2:
         return rect
+
+    # Compute weighted average angle from Hough lines
+    all_angles = []
+    for a, length in h_angles:
+        all_angles.append((a, length))
+    for a, length in v_angles:
+        all_angles.append((a, length))
+
+    if all_angles:
+        total_weight = sum(length for _, length in all_angles)
+        if total_weight > 0:
+            weighted_angle_rad = sum(a * length for a, length in all_angles) / total_weight
+            hough_angle = np.rad2deg(weighted_angle_rad)
+            # Only use hough angle if it's reasonable (within ±45 degrees)
+            if abs(hough_angle) <= 45:
+                angle = hough_angle
 
     # Find the inner-most horizontal and vertical lines
     h_lines = sorted(h_lines)
@@ -626,7 +707,7 @@ def _refine_with_hough_lines(gray_image, rect):
     new_cx = (left + right) / 2.0
     new_cy = (top + bottom) / 2.0
 
-    return ((new_cx, new_cy), (new_w, new_h), 0.0)
+    return ((new_cx, new_cy), (new_w, new_h), angle)
 
 
 def detect_largest_rectangle(
